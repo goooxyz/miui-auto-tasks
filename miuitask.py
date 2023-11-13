@@ -31,6 +31,8 @@ class MIUITask:
         self.cookie = ''
         # 留空
         self.miui_vip_ph = ''
+        # 留空
+        self.userName = ''
 
     # 签名
     def post_sign(self, data):
@@ -446,12 +448,36 @@ class MIUITask:
             your_point = re.findall(r"'title': '成长值'.*'title': '(\d+)'.*'title': '/'", str(r_json['entity']))[0]
             your_level = re.findall(r"'title': '(\d+段)', 'desc': '当前等级'", str(r_json['entity']))[0]
 
-            w_log('当前等级：' + str(your_level) + ', 当前成长值：' + str(your_point))
+            w_log(self.userName + '(' +  self.uid+ ')' + '当前等级：' + str(your_level) + ', 当前成长值：' + str(your_point))
 
             return your_point, your_level
         except Exception as e:
-            w_log('成长值和等级获取失败')
+            w_log(self.userName + '(' +  self.uid+ ')' + '成长值和等级获取失败')
             w_log(e)
+            process_exception(e)
+    
+    #取用户名
+    def get_point_userName(self) -> Tuple[Any, Any]:
+
+        headers = {
+            'cookie': str(self.cookie)
+        }
+        params = {
+            'userId': str(self.uid),
+            
+            'miui_vip_ph': str(self.miui_vip_ph)
+
+        }
+        try:
+            response = requests.post('https://api.vip.miui.com/mtop/planet/vip/user/info?', headers=headers,params=params)
+            r_json = response.json()
+            self.userName = re.findall(r"'userName': '([^']*)'", str(r_json['entity']))[0]
+            # w_log('账号' + self.uid + '社区用户名：' + str(userName))
+            # w_log(r_json)
+            return self.userName
+        except Exception as e:
+            w_log(r_json)
+            w_log('账号' + self.uid + '社区用户名获取失败')
             process_exception(e)
 
 
@@ -538,6 +564,9 @@ def start(miui_task: MIUITask, check_in: bool, browse_post: bool, browse_user_pa
             random_sleep()
             miui_task.carrot_pull()
         random_sleep()
+        #取用户名
+        miui_task.get_point_userName()
+        #取成长值
         miui_task.get_point()
 
 
