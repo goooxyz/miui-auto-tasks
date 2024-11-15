@@ -1,17 +1,19 @@
-FROM python:3.9-alpine
+FROM python:alpine
 
-COPY ./utils /srv/utils/
+RUN apk add --no-cache gcc g++ musl-dev python3-dev libffi-dev rust openssl-dev cargo pkgconfig
 
-COPY ./requirements.txt /tmp
-
-COPY ./miuitask.py /srv/
-
-VOLUME ["./data", "/srv/data"]
-
-RUN pip install --no-cache-dir -i https://mirrors.bfsu.edu.cn/pypi/web/simple -r /tmp/requirements.txt && \
-    rm -rf /tmp/* && \
-    echo "0   4	*	*	*	python /srv/miuitask.py" > /var/spool/cron/crontabs/root
+RUN pip install --no-cache-dir pdm
 
 WORKDIR /srv
 
-CMD ["/usr/sbin/crond", "-f"]
+COPY ./utils ./utils
+
+COPY ./pyproject.toml ./pdm.lock ./miuitask.py ./docker_start.sh ./
+
+RUN pdm install --prod && \
+    echo '0 4 * * * /bin/sh -c "sleep $((RANDOM % 1800 + 1)); cd /srv && pdm run /srv/miuitask.py"' > /var/spool/cron/crontabs/root && \
+    chmod +x docker_start.sh
+
+VOLUME ["/srv/data", "/srv/logs"]
+
+CMD ["/srv/docker_start.sh"]

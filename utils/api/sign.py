@@ -1,10 +1,20 @@
+'''
+Date: 2023-12-03 02:07:29
+LastEditors: Night-stars-1 nujj1042633805@gmail.com
+LastEditTime: 2023-12-31 01:28:23
+'''
 import time
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
-from typing import Dict, List, Optional, Set, Type, Union
+from requests_toolbelt import MultipartEncoder
+from tenacity import RetryError, Retrying, stop_after_attempt
 
-from ..data_model import ApiResultHandler, DailyTasksResult, SignResultHandler
-from ..request import get, post
+from ..config import Account
+from ..data_model import (ApiResultHandler, DailyTasksResult,
+                          SignResultHandler, UserInfoResult)
 from ..logger import log
+from ..request import get, post
+from ..utils import get_random_chars_as_string, is_incorrect_return
 
 
 class BaseSign:
@@ -26,67 +36,162 @@ class BaseSign:
     AVAILABLE_SIGNS: Dict[str, Type["BaseSign"]] = {}
     """可用的子类"""
 
-    def __init__(self, cookie: Dict, token: Optional[str] = None):
-        self.cookie = cookie
+    def __init__(self, account: Account, token: Optional[str] = None):
+        self.cookies = account.cookies
         self.token = token
+        self.user_agent = account.user_agent
         self.headers = {
+            'Host': 'api-alpha.vip.miui.com',
+            'Connection': 'keep-alive',
+            'Pragma': 'no-cache',
+            'Cache-Control': 'no-cache',
+            'sec-ch-ua': 'Not_A',
+            'Accept': 'application/json',
+            'sec-ch-ua-mobile': '?1',
+            'User-Agent': self.user_agent,
+            'sec-ch-ua-platform': 'Android',
+            'Origin': 'https://web-alpha.vip.miui.com',
+            'X-Requested-With': 'com.xiaomi.vipaccount',
+            'Sec-Fetch-Site': 'same-site',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Dest': 'empty',
+            'Referer': 'https://web-alpha.vip.miui.com/',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        }
+        self.params = {
+            'ref': 'vipAccountShortcut',
+            'pathname': '/mio/detail',
+            'version': 'dev.20231205',
+            'miui_version': 'V816.0.23.12.11.DEV',
+            'android_version': '14',
+            'oaid': {get_random_chars_as_string(16, "0123456789abcdefghijklmnopqrstuvwxyz")},
+            'device': account.device,
+            'restrict_imei': '',
+            'miui_big_version': 'V816',
+            'model': account.device_model,
+            'androidVersion': '14',
+            'miuiBigVersion': 'V816',
+            'miui_vip_a_ph': None,
         }
 
-    async def check_daily_tasks(self, nolog: bool=False) -> Union[List[DailyTasksResult], List[None]]:
+    async def check_daily_tasks(self, nolog: bool = False) -> Union[List[DailyTasksResult], List[None]]:
+        """获取每日任务状态"""
         try:
-            response = await get('https://api.vip.miui.com/mtop/planet/vip/member/getCheckinPageCakeList',
-                                 cookies=self.cookie)
-            log.debug(response.text)
-            result = response.json()
-            api_data = ApiResultHandler(result)
-            if api_data.success:
-                task_status = []
-                task = next(filter(lambda x: x['head']['title'] == "每日任务", api_data.data))
-                for daily_task in task['data']:
-                    task_name = daily_task['title']
-                    task_desc = daily_task.get('desc', '')
-                    showType = True if daily_task['showType'] == 0 else False
-                    task_status.append(DailyTasksResult(name=task_name, showType=showType, desc=task_desc))
-                return task_status
+            for attempt in Retrying(stop=stop_after_attempt(3)):
+                with attempt:
+                    response = await get('https://api-alpha.vip.miui.com/mtop/planet/vip/member/getCheckinPageCakeList',
+                                        cookies=self.cookies)
+                    log.debug(response.text)
+                    result = response.json()
+                    api_data = ApiResultHandler(result)
+                    if api_data.success:
+                        task_status = []
+                        tasks: List[Dict[str, List[Dict[str, Any]]]] = list(filter(
+                            lambda x: x['head']['title'] in ["每日任务", "其他任务"], api_data.data))
+                        for task in tasks:
+                            for daily_task in task['data']:
+                                task_name = daily_task['title']
+                                task_desc = daily_task.get('desc', '')
+                                show_type = True if daily_task['showType'] == 0 else False  # pylint: disable=simplifiable-if-expression
+                                task_status.append(DailyTasksResult(name=task_name, showType=show_type, desc=task_desc))
+                        return task_status
+                    else:
+                        if not nolog:
+                            log.error(f"获取每日任务状态失败：{api_data.message}")
+                    return []
+        except RetryError as error:
+            if is_incorrect_return(error):
+                log.exception(f"每日任务 - 服务器没有正确返回 {response.text}")
             else:
-                log.error("获取每日任务状态失败：" + api_data.message) if not nolog else None
-                return []
-        except Exception:
-            log.exception("获取每日任务异常") if not nolog else None
+                log.exception("获取每日任务异常")
             return []
 
-    async def sign(self) -> bool:
+    async def sign(self) -> Tuple[bool, str]: # pylint: disable=too-many-branches
         """
         每日任务处理器
         """
         try:
-            params = self.PARAMS.copy()
-            params['miui_vip_ph'] = self.cookie['miui_vip_ph'] if 'miui_vip_ph' in self.cookie else params
-            params['token'] = self.token if 'token' in params else params
-            data = self.DATA.copy()
-            data['miui_vip_ph'] = self.cookie['miui_vip_ph'] if 'miui_vip_ph' in self.cookie else data
-            data['token'] = self.token if 'token' in data else data
-            response = await post(self.URL_SIGN,
-                                  params=params, data=data,
-                                  cookies=self.cookie, headers=self.headers)
-            log.debug(response.text)
-            result = response.json()
-            api_data = SignResultHandler(result)
-            if api_data:
-                log.success(f"{self.NAME}结果: 成长值+" + api_data.growth)
-                return True
-            elif api_data.ck_invalid:
-                log.error(f"{self.NAME}失败: Cookie无效")
-                return False
+            for attempt in Retrying(stop=stop_after_attempt(3)):
+                with attempt:
+                    params = self.PARAMS.copy()
+                    if 'miui_vip_a_ph' in self.cookies:
+                        params['miui_vip_a_ph'] = self.cookies['miui_vip_a_ph']
+                    if 'token' in params:
+                        params['token'] = self.token
+                    self.params.update(params)
+                    self.params["version"] = self.user_agent.split("/")[-1]
+
+                    data = self.DATA.copy()
+                    if 'miui_vip_a_ph' in self.cookies:
+                        data['miui_vip_a_ph'] = self.cookies['miui_vip_a_ph']
+                    if 'token' in data:
+                        if self.token:
+                            data['token'] = self.token
+                        else:
+                            log.info(f"未获取到token, 跳过{self.NAME}")
+                            return False, "None"
+                    boundary=f'----WebKitFormBoundaryZ{get_random_chars_as_string(16, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")}'
+                    data = MultipartEncoder(fields=data, boundary=boundary)
+                    self.headers['Content-Type'] = data.content_type
+                    response = await post(self.URL_SIGN,
+                                        params=self.params, data=data.to_string(),
+                                        cookies=self.cookies, headers=self.headers)
+                    log.debug(response.text)
+                    result = response.json()
+                    api_data = SignResultHandler(result)
+                    if api_data:
+                        if api_data.growth:
+                            log.success(f"{self.NAME}结果: 成长值+{api_data.growth}")
+                        else:
+                            log.success(f"{self.NAME}结果: {api_data.message}")
+                        return True, "None"
+                    elif api_data.ck_invalid:
+                        log.error(f"{self.NAME}失败: Cookie无效")
+                        return False, "cookie"
+                    else:
+                        log.error(f"{self.NAME}失败：{api_data.message}")
+                        return False, "None"
+        except RetryError as error:
+            if is_incorrect_return(error):
+                log.exception(f"{self.NAME} - 服务器没有正确返回 {response.text}")
             else:
-                log.error(f"{self.NAME}失败：" + api_data.message)
-                return False
-        except Exception:
-            log.exception(f"{self.NAME}出错")
-            return False
+                log.exception("{self.NAME}出错")
+            return False, "None"
 
+    async def user_info(self) -> UserInfoResult:
+        """获取用户信息"""
+        try:
+            for attempt in Retrying(stop=stop_after_attempt(3)):
+                with attempt:
+                    headers = {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'User-Agent': self.user_agent,
+                        'Request-Container-Mark': 'android',
+                        'Host': 'api-alpha.vip.miui.com',
+                        'Connection': 'Keep-Alive',
+                    }
 
-class Check_In(BaseSign):
+                    response = await get(
+                        'https://api-alpha.vip.miui.com/mtop/planet/vip/homepage/mineInfo',
+                        cookies=self.cookies,
+                        headers=headers,
+                    )
+                    log.debug(response.text)
+                    result = response.json()
+                    api_data = ApiResultHandler(result)
+                    if api_data.success:
+                        return UserInfoResult.model_validate(api_data.data)
+                    else:
+                        log.error(f"获取用户信息失败：{api_data.message}")
+                        return UserInfoResult()
+        except RetryError as error:
+            if is_incorrect_return(error):
+                log.exception(f"用户信息 - 服务器没有正确返回 {response.text}")
+            else:
+                log.exception("获取用户信息异常")
+            return UserInfoResult()
+#pylint: disable=trailing-whitespace
+class CheckIn(BaseSign):
     """
     每日签到
     """
@@ -96,17 +201,17 @@ class Check_In(BaseSign):
         'ref': 'vipAccountShortcut',
         'pathname': '/mio/checkIn',
         'version': 'dev.231026',
-        'miui_vip_ph': "{miui_vip_ph}"
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
     }
 
     DATA = {
-        'miui_vip_ph': "{miui_vip_ph}",
-        'token': ""
+        'miui_vip_a_ph': "{miui_vip_a_ph}",
+        'token': "{token}"
     }
-    URL_SIGN = 'https://api.vip.miui.com/mtop/planet/vip/user/checkinV2'
+    URL_SIGN = 'https://api-alpha.vip.miui.com/mtop/planet/vip/user/checkinV2'
 
 
-class Browse_Post(BaseSign):
+class BrowsePost(BaseSign):
     """
     浏览帖子超过10秒
     """
@@ -116,16 +221,16 @@ class Browse_Post(BaseSign):
         'ref': 'vipAccountShortcut',
         'pathname': '/mio/detail',
         'version': 'dev.231026',
-        'miui_vip_ph': "{miui_vip_ph}"
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
     }
     DATA = {
         'action': 'BROWSE_POST_10S',
-        'miui_vip_ph': "{miui_vip_ph}"
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
     }
-    URL_SIGN = 'https://api.vip.miui.com/mtop/planet/vip/member/addCommunityGrowUpPointByActionV2'
+    URL_SIGN = 'https://api-alpha.vip.miui.com/mtop/planet/vip/member/addCommunityGrowUpPointByActionV2'
 
 
-class Browse_User_Page(BaseSign):
+class BrowseUserPage(BaseSign):
     """
     浏览个人主页10s
     """
@@ -135,16 +240,16 @@ class Browse_User_Page(BaseSign):
         'ref': 'vipAccountShortcut',
         'pathname': '/mio/detail',
         'version': 'dev.231026',
-        'miui_vip_ph': "{miui_vip_ph}"
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
     }
     DATA = {
         'action': 'BROWSE_SPECIAL_PAGES_USER_HOME',
-        'miui_vip_ph': "{miui_vip_ph}"
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
     }
-    URL_SIGN = 'https://api.vip.miui.com/mtop/planet/vip/member/addCommunityGrowUpPointByActionV2'
+    URL_SIGN = 'https://api-alpha.vip.miui.com/mtop/planet/vip/member/addCommunityGrowUpPointByActionV2'
 
 
-class Browse_Special_Page(BaseSign):
+class BrowseSpecialPage(BaseSign):
     """
     浏览指定专题页
     """
@@ -154,16 +259,35 @@ class Browse_Special_Page(BaseSign):
         'ref': 'vipAccountShortcut',
         'pathname': '/mio/detail',
         'version': 'dev.231026',
-        'miui_vip_ph': "{miui_vip_ph}"
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
     }
     DATA = {
         'action': 'BROWSE_SPECIAL_PAGES_SPECIAL_PAGE',
-        'miui_vip_ph': "{miui_vip_ph}"
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
     }
-    URL_SIGN = 'https://api.vip.miui.com/mtop/planet/vip/member/addCommunityGrowUpPointByActionV2'
+    URL_SIGN = 'https://api-alpha.vip.miui.com/mtop/planet/vip/member/addCommunityGrowUpPointByActionV2'
 
 
-class Board_Follow(BaseSign):
+class BrowseVideoPost(BaseSign):
+    """
+    浏览指定页面的多个视频超过5分钟（中途退出重新计算时间）
+    """
+    NAME = "浏览指定页面的多个视频超过5分钟（中途退出重新计算时间）"
+
+    PARAMS = {
+        'ref': 'vipAccountShortcut',
+        'pathname': '/mio/detail',
+        'version': 'dev.231026',
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
+    }
+    DATA = {
+        'action': 'BROWSE_VIDEO_POST',
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
+    }
+    URL_SIGN = 'https://api-alpha.vip.miui.com/mtop/planet/vip/member/addCommunityGrowUpPointByActionV2'
+
+
+class BoardFollow(BaseSign):
     """
     加入小米圈子
     """
@@ -173,13 +297,13 @@ class Board_Follow(BaseSign):
         'pathname': '/mio/allboard',
         'version': 'dev.20051',
         'boardId': '558495',
-        'miui_vip_ph': "{miui_vip_ph}"
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
     }
 
-    URL_SIGN = 'https://api.vip.miui.com/api/community/board/follow'
+    URL_SIGN = 'https://api-alpha.vip.miui.com/api/community/board/follow'
 
 
-class Board_UnFollow(BaseSign):
+class BoardUnFollow(BaseSign):
     """
     退出小米圈子
     """
@@ -189,13 +313,13 @@ class Board_UnFollow(BaseSign):
         'pathname': '/mio/allboard',
         'version': 'dev.20051',
         'boardId': '558495',
-        'miui_vip_ph': "{miui_vip_ph}"
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
     }
 
-    URL_SIGN = 'https://api.vip.miui.com/api/community/board/unfollow'
+    URL_SIGN = 'https://api-alpha.vip.miui.com/api/community/board/unfollow'
 
 
-class Thumb_Up(BaseSign):
+class ThumbUp(BaseSign):
     """
     点赞他人帖子
     """
@@ -207,14 +331,27 @@ class Thumb_Up(BaseSign):
         'timestamp': int(round(time.time() * 1000))
     }
 
-    URL_SIGN = 'https://api.vip.miui.com/mtop/planet/vip/content/announceThumbUp'
+    URL_SIGN = 'https://api-alpha.vip.miui.com/mtop/planet/vip/content/announceThumbUp'
+
+
+class CarrotPull(BaseSign):
+    """
+    参与拔萝卜获得奖励
+    """
+    NAME = "参与拔萝卜获得奖励"
+    DATA = {
+        'miui_vip_a_ph': "{miui_vip_a_ph}"
+    }
+    URL_SIGN = 'https://api-alpha.vip.miui.com/api/carrot/pull'
 
 
 # 注册签到任务
-BaseSign.AVAILABLE_SIGNS[Check_In.NAME] = Check_In
-BaseSign.AVAILABLE_SIGNS[Browse_Post.NAME] = Browse_Post
-BaseSign.AVAILABLE_SIGNS[Browse_User_Page.NAME] = Browse_User_Page
-BaseSign.AVAILABLE_SIGNS[Browse_Special_Page.NAME] = Browse_Special_Page
-BaseSign.AVAILABLE_SIGNS[Board_Follow.NAME] = Board_Follow
-BaseSign.AVAILABLE_SIGNS[Board_UnFollow.NAME] = Board_UnFollow
-BaseSign.AVAILABLE_SIGNS[Thumb_Up.NAME] = Thumb_Up
+BaseSign.AVAILABLE_SIGNS[CheckIn.NAME] = CheckIn
+BaseSign.AVAILABLE_SIGNS[BrowsePost.NAME] = BrowsePost
+BaseSign.AVAILABLE_SIGNS[BrowseVideoPost.NAME] = BrowseVideoPost
+BaseSign.AVAILABLE_SIGNS[BrowseUserPage.NAME] = BrowseUserPage
+BaseSign.AVAILABLE_SIGNS[BrowseSpecialPage.NAME] = BrowseSpecialPage
+BaseSign.AVAILABLE_SIGNS[BoardFollow.NAME] = BoardFollow
+BaseSign.AVAILABLE_SIGNS[BoardUnFollow.NAME] = BoardUnFollow
+BaseSign.AVAILABLE_SIGNS[ThumbUp.NAME] = ThumbUp
+BaseSign.AVAILABLE_SIGNS[CarrotPull.NAME] = CarrotPull
